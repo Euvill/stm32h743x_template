@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32H743 Debug (CMSIS-DAP)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            "executable": "./build/led_blink.elf", // 请务必替换为您的实际 .elf 文件路径
+            "runToEntryPoint": "main", /// 程序进入调试后的入口点，通常会停在这里；
+            "device": "STM32H743VIT6",
+            "svdFile": "./Debug/svd/STM32H743.svd", // SVD 文件路径，稍后配置
+            "configFiles": [
+                "./Debug/interface/cmsis-dap.cfg",
+                "./Debug/target/stm32h7x.cfg",    // 关键更改：指定 H7 系列目标文件
+            ],
+            "serverArgs": [
+                "-c", "adapter speed 500",
+                "-c", "stm32h7x.cpu0 configure -event gdb-attach { reset halt }"
+            ],
+            "preLaunchTask": "build"
+        }
+    ]
+}

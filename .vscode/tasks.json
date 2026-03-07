@@ -1,0 +1,63 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "make",
+      "args": ["-j"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "make",
+      "args": ["clean"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "flash",
+      "type": "shell",
+      "dependsOn": "build",
+      "command": "openocd",
+      "args": [
+        "-f", "./Debug/interface/cmsis-dap.cfg",
+        "-c", "transport select swd",
+        "-f", "./Debug/target/stm32h7x.cfg",
+        "-c", "adapter speed 1000",
+        "-c", "program ./build/led_blink.hex verify reset exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "gen compile_commands",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "-m",
+        "compiledb",
+        "-n",
+        "-o",
+        "build/compile_commands.json",
+        "make",
+        "-B"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
