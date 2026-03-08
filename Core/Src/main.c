@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
@@ -31,6 +32,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UART_SEND_PERIOD_MS    1000U
+#define UART_RX_BUFFER_SIZE    128U
+#define UART_RX_IDLE_MS        20U
 
 /* USER CODE END PD */
 
@@ -41,7 +45,17 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
+static uint32_t uart_send_last_tick = 0U;
+static uint32_t uart_counter = 0U;
+static uint8_t uart_rx_byte = 0U;
+static char uart_rx_buffer[UART_RX_BUFFER_SIZE] = {0};
+static uint16_t uart_rx_len = 0U;
+static uint32_t uart_rx_last_tick = 0U;
+static char uart_tx_buffer[64] = {0};
+static char uart_reply_buffer[192] = {0};
 
 /* USER CODE END PV */
 
@@ -49,12 +63,55 @@
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static void UART_FlushReceivedMessage(void);
+static void UART_ProcessReceivedByte(uint8_t byte);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void UART_FlushReceivedMessage(void)
+{
+  int reply_len = 0;
+
+  if (uart_rx_len == 0U)
+  {
+    return;
+  }
+
+  reply_len = snprintf(uart_reply_buffer, sizeof(uart_reply_buffer),
+                       "receive the data from pc: %s\r\n", uart_rx_buffer);
+  if (reply_len > 0)
+  {
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_reply_buffer, (uint16_t)reply_len, HAL_MAX_DELAY);
+  }
+
+  uart_rx_len = 0U;
+  uart_rx_buffer[0] = '\0';
+}
+
+static void UART_ProcessReceivedByte(uint8_t byte)
+{
+  if ((byte == '\r') || (byte == '\n'))
+  {
+    UART_FlushReceivedMessage();
+    return;
+  }
+
+  if (uart_rx_len < (UART_RX_BUFFER_SIZE - 1U))
+  {
+    uart_rx_buffer[uart_rx_len++] = (char)byte;
+    uart_rx_buffer[uart_rx_len] = '\0';
+    uart_rx_last_tick = HAL_GetTick();
+  }
+  else
+  {
+    uart_rx_len = 0U;
+    uart_rx_buffer[0] = '\0';
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -90,7 +147,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  uart_send_last_tick = HAL_GetTick();
+  uart_rx_last_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
 
@@ -99,9 +159,31 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-    HAL_Delay(500);
+
     /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    if ((now - uart_send_last_tick) >= UART_SEND_PERIOD_MS)
+    {
+      int tx_len = snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "%lu\r\n", (unsigned long)uart_counter++);
+      uart_send_last_tick = now;
+
+      if (tx_len > 0)
+      {
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_tx_buffer, (uint16_t)tx_len, HAL_MAX_DELAY);
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      }
+    }
+
+    while (HAL_UART_Receive(&huart1, &uart_rx_byte, 1U, 0U) == HAL_OK)
+    {
+      UART_ProcessReceivedByte(uart_rx_byte);
+    }
+
+    if ((uart_rx_len > 0U) && ((HAL_GetTick() - uart_rx_last_tick) >= UART_RX_IDLE_MS))
+    {
+      UART_FlushReceivedMessage();
+    }
   }
   /* USER CODE END 3 */
 }
@@ -163,6 +245,54 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 9600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
 }
 
 /**

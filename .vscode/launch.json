@@ -16,7 +16,7 @@
                 "./Debug/target/stm32h7x.cfg",    // 关键更改：指定 H7 系列目标文件
             ],
             "serverArgs": [
-                "-c", "adapter speed 1000",
+                "-c", "adapter speed 500",
                 "-c", "reset_config none",
                 "-c", "cortex_m reset_config sysresetreq",
                 "-c", "stm32h7x.cpu0 configure -event gdb-attach { reset halt }"
