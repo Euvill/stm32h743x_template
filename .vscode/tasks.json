@@ -34,6 +34,10 @@
         "-c", "transport select swd",
         "-f", "./Debug/target/stm32h7x.cfg",
         "-c", "adapter speed 1000",
+        // 1. 明确告诉 OpenOCD：不要去管物理复位线了
+        "-c", "reset_config none",
+        // 2. 强制指定 Cortex-M 内核使用 SYSRESETREQ 进行系统软件复位
+        "-c", "cortex_m reset_config sysresetreq",
         "-c", "program ./build/led_blink.hex verify reset exit"
       ],
       "options": {
