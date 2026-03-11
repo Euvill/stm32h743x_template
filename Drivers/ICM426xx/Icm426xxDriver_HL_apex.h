@@ -35,9 +35,9 @@
 extern "C" {
 #endif
 
-#include "../Invn/Drivers/Icm426xx/Icm426xxDefs.h"
+#include "Icm426xxDefs.h"
 
-#include "../Invn/InvError.h"
+#include "InvError.h"
 
 #include <stdint.h>
 #include <string.h>

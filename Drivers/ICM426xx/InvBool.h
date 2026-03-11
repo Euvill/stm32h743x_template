@@ -21,56 +21,27 @@
  * ________________________________________________________________________________________________________
  */
 
-/** @defgroup SelfTest Self-test
- *  @brief    API to execute self-test procedures.
- *  @{
+/** @brief    Custom definition for boolean type to avoid compiler disrepenrencies
+ *	@{
  */
 
-/** @file Icm426xxSelfTest.h */
+#ifndef _INV_BOOL_H_
+#define _INV_BOOL_H_
 
-#ifndef _INV_ICM426XX_SELFTEST_H_
-#define _INV_ICM426XX_SELFTEST_H_
+typedef int inv_bool_t;
 
-#include "InvExport.h"
+#ifndef __cplusplus
 
-#ifdef __cplusplus
-extern "C" {
+#ifndef true
+	#define true    1
 #endif
 
-/* forward declaration */
-struct inv_icm426xx;
-
-/** @brief Perform hardware self-test for Accel and Gyro
- *  @param[in] s       Pointer to device.
- *  @param[in] result  Containing ACCEL_SUCCESS<<1 | GYRO_SUCCESS so 3
- *  @return            0 on success, negative value on error.
- */
-int inv_icm426xx_run_selftest(struct inv_icm426xx *s, int *result);
-
-/** @brief Retrieve bias collected by self-test.
- *  @param[in] s         Pointer to device.
- *  @param[out] st_bias  Bias scaled by 2^16, accel is gee and gyro is dps.
- *                       The buffer will be filled as below.
- *                       Gyro LN mode X,Y,Z
- *                       Accel LN mode X,Y,Z
- *  @return              0 on success, negative value on error.
- */
-int inv_icm426xx_get_st_bias(struct inv_icm426xx *s, int st_bias[6]);
-
-/** @brief Apply bias.
- *  @param[in] s        Pointer to device.
- *  @param[in] st_bias  Bias scaled by 2^16, accel is gee and gyro is dps.
- *                      The buffer must be filled as below.
- *                      Gyro LN mode X,Y,Z
- *                      Accel LN mode X,Y,Z
- *  @return             0 on success, negative value on error.
- */
-int inv_icm426xx_set_st_bias(struct inv_icm426xx *s, const int st_bias[6]);
-
-#ifdef __cplusplus
-}
+#ifndef false
+	#define false   0
 #endif
 
-#endif /* _INV_ICM426XX_SELFTEST_H_ */
+#endif /* __cplusplus */
+
+#endif /* _INV_BOOL_H_ */
 
 /** @} */

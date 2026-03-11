@@ -34,6 +34,8 @@ extern "C" {
 
 #include <stdint.h>
 
+#define ICM42688P
+
 /* List whoami values for all icm426xx variants*/
 #define ICM40608_WHOAMI  0x39
 #define ICM42600_WHOAMI  0x40

@@ -59,6 +59,8 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 
 /* USER CODE BEGIN Private defines */
+#define ICM42688P_CS_Pin GPIO_PIN_4
+#define ICM42688P_CS_GPIO_Port GPIOA
 
 /* USER CODE END Private defines */
 

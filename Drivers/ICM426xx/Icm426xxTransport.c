@@ -21,10 +21,10 @@
  * ________________________________________________________________________________________________________
  */
 
-#include "../Invn/Drivers/Icm426xx/Icm426xxTransport.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxDefs.h"
+#include "Icm426xxTransport.h"
+#include "Icm426xxDefs.h"
 
-#include "../Invn/InvError.h"
+#include "InvError.h"
 
 /* Function definition */
 static uint8_t *get_register_cache_addr(struct inv_icm426xx *s, uint8_t reg);

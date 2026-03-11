@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <ctype.h>
 #include <stdio.h>
+#include <string.h>
+#include "icm42688p.h"
 
 /* USER CODE END Includes */
 
@@ -32,9 +35,24 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define UART_SEND_PERIOD_MS    1000U
+/*
+ * Runtime print period once the full IMU startup sequence has completed.
+ * At that point we print converted values, not the original raw registers.
+ */
+#define UART_SEND_PERIOD_MS    200U
 #define UART_RX_BUFFER_SIZE    128U
 #define UART_RX_IDLE_MS        20U
+
+/* According to the INV self-test API:
+ * bit0 = gyro pass
+ * bit1 = accel pass
+ * therefore 0x03 means both sensors passed.
+ */
+#define IMU_SELF_TEST_PASS_MASK      0x03
+
+/* Fixed-point helpers used only for UART formatting. */
+#define FIXED_POINT_3_SCALE          1000UL
+#define FIXED_POINT_2_SCALE          100UL
 
 /* USER CODE END PD */
 
@@ -45,16 +63,29 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+SPI_HandleTypeDef hspi3;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+/*
+ * Application-level state used only by the demo in main.c.
+ *
+ * The IMU driver state itself lives inside icm42688p.c; these variables only
+ * store:
+ * - the latest sample for printing
+ * - the latest reported official self-test bias values
+ * - UART receive helper state
+ * - temporary text buffers
+ */
 static uint32_t uart_send_last_tick = 0U;
-static uint32_t uart_counter = 0U;
 static uint8_t uart_rx_byte = 0U;
 static char uart_rx_buffer[UART_RX_BUFFER_SIZE] = {0};
 static uint16_t uart_rx_len = 0U;
 static uint32_t uart_rx_last_tick = 0U;
-static char uart_tx_buffer[64] = {0};
+static ICM42688P_Data_t imu_data;
+static ICM42688P_OfficialBias_t imu_official_bias;
+static char uart_tx_buffer[192] = {0};
 static char uart_reply_buffer[192] = {0};
 
 /* USER CODE END PV */
@@ -64,14 +95,29 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_SPI3_Init(void);
 /* USER CODE BEGIN PFP */
 static void UART_FlushReceivedMessage(void);
 static void UART_ProcessReceivedByte(uint8_t byte);
+static void UART_SendString(const char *text);
+static long UART_ScaleFloat(float value, long scale);
+static void UART_FormatFixedPoint(char *buffer, size_t buffer_size, long scaled_value, unsigned long scale, unsigned int decimals);
+static int UART_IsEnterCommand(const char *command);
+static void UART_WaitForEnterCommand(void);
+static void UART_PrintOfficialBiasReport(const ICM42688P_OfficialBias_t *bias);
+static void UART_PrintConvertedImuData(const ICM42688P_Data_t *data);
+static int IMU_StartupSequence(void);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
+ * Flush the small UART receive line buffer.
+ *
+ * This is unrelated to the IMU logic. It is only a simple echo-style helper
+ * kept from the original template so incoming UART text can still be observed.
+ */
 static void UART_FlushReceivedMessage(void)
 {
   int reply_len = 0;
@@ -92,6 +138,7 @@ static void UART_FlushReceivedMessage(void)
   uart_rx_buffer[0] = '\0';
 }
 
+/* Push one received byte into the line buffer and flush on CR/LF. */
 static void UART_ProcessReceivedByte(uint8_t byte)
 {
   if ((byte == '\r') || (byte == '\n'))
@@ -111,6 +158,349 @@ static void UART_ProcessReceivedByte(uint8_t byte)
     uart_rx_len = 0U;
     uart_rx_buffer[0] = '\0';
   }
+}
+
+/*
+ * Minimal "send one C string" helper.
+ *
+ * The goal is to keep later status-printing code readable. Without this helper,
+ * startup code would be cluttered with repeated HAL_UART_Transmit calls.
+ */
+static void UART_SendString(const char *text)
+{
+  if (text == NULL)
+  {
+    return;
+  }
+
+  HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)strlen(text), HAL_MAX_DELAY);
+}
+
+/*
+ * Convert a floating-point value to an integer scaled by `scale`.
+ *
+ * Example:
+ * value = 1.234, scale = 1000 -> returns about 1234
+ *
+ * We do this so the later UART formatting step can build a predictable
+ * fixed-point decimal string without relying on `%f`, which is often avoided in
+ * embedded `printf` configurations for size reasons.
+ */
+static long UART_ScaleFloat(float value, long scale)
+{
+  if (value >= 0.0f)
+  {
+    return (long)(value * (float)scale + 0.5f);
+  }
+
+  return (long)(value * (float)scale - 0.5f);
+}
+
+/*
+ * Format an already-scaled integer as a decimal string.
+ *
+ * Example:
+ * scaled_value = -1234, scale = 1000, decimals = 3
+ * output       = "-1.234"
+ *
+ * This helper is used by both bias-report printing and normal runtime data
+ * printing so those higher-level functions can stay easy to scan.
+ */
+static void UART_FormatFixedPoint(char *buffer, size_t buffer_size, long scaled_value, unsigned long scale, unsigned int decimals)
+{
+  const char *sign = "";
+  unsigned long abs_value;
+  unsigned long whole;
+  unsigned long fraction;
+
+  if ((buffer == NULL) || (buffer_size == 0U) || (scale == 0UL))
+  {
+    return;
+  }
+
+  if (scaled_value < 0L)
+  {
+    sign = "-";
+  }
+
+  abs_value = (scaled_value < 0L) ? (unsigned long)(-scaled_value) : (unsigned long)scaled_value;
+  whole = abs_value / scale;
+  fraction = abs_value % scale;
+
+  (void)snprintf(buffer, buffer_size, "%s%lu.%0*lu", sign, whole, (int)decimals, fraction);
+}
+
+/*
+ * Check whether one UART line should be treated as the "start runtime" command.
+ *
+ * We intentionally accept two user habits:
+ * - just press Enter on an empty line
+ * - type "enter" and then press Enter
+ *
+ * That makes the startup gate easy to trigger from common serial tools.
+ */
+static int UART_IsEnterCommand(const char *command)
+{
+  static const char expected_command[] = "enter";
+  size_t index = 0U;
+
+  if (command == NULL)
+  {
+    return 0;
+  }
+
+  if (command[0] == '\0')
+  {
+    return 1;
+  }
+
+  while (expected_command[index] != '\0')
+  {
+    if ((char)tolower((unsigned char)command[index]) != expected_command[index])
+    {
+      return 0;
+    }
+
+    index++;
+  }
+
+  return (command[index] == '\0') ? 1 : 0;
+}
+
+/*
+ * Block startup until the operator explicitly allows runtime output to begin.
+ *
+ * Why wait here instead of immediately entering the main loop:
+ * - the self-test report stays on screen long enough for the user to read it
+ * - the first stream of 200 ms runtime prints does not immediately scroll the
+ *   bias report away
+ * - the user can decide exactly when the application starts its normal phase
+ *
+ * Accepted UART actions:
+ * - press Enter on an empty line
+ * - type "enter" then press Enter
+ */
+static void UART_WaitForEnterCommand(void)
+{
+  char command_buffer[16] = {0};
+  uint8_t rx_char = 0U;
+  uint8_t command_length = 0U;
+
+  UART_SendString("ICM42688P initialization complete.\r\n");
+  UART_SendString("Press Enter, or type 'enter' then press Enter, to start runtime output.\r\n");
+
+  while (1)
+  {
+    if (HAL_UART_Receive(&huart1, &rx_char, 1U, HAL_MAX_DELAY) != HAL_OK)
+    {
+      continue;
+    }
+
+    if ((rx_char == '\r') || (rx_char == '\n'))
+    {
+      command_buffer[command_length] = '\0';
+
+      if (UART_IsEnterCommand(command_buffer) != 0)
+      {
+        UART_SendString("Runtime output started.\r\n");
+        return;
+      }
+
+      UART_SendString("Unknown command. Press Enter or send 'enter'.\r\n");
+      command_length = 0U;
+      command_buffer[0] = '\0';
+      continue;
+    }
+
+    if (command_length < (sizeof(command_buffer) - 1U))
+    {
+      command_buffer[command_length++] = (char)rx_char;
+      command_buffer[command_length] = '\0';
+    }
+    else
+    {
+      UART_SendString("Command too long. Press Enter or send 'enter'.\r\n");
+      command_length = 0U;
+      command_buffer[0] = '\0';
+    }
+  }
+}
+
+/*
+ * Print the bias report reported by the official INV self-test path.
+ *
+ * We print each axis twice:
+ * - exact Q16 value returned by inv_icm426xx_get_st_bias()
+ * - converted engineering value for fast human inspection
+ *
+ * This is useful when comparing:
+ * - our project log
+ * - official driver behavior
+ * - future register-level debugging
+ */
+static void UART_PrintOfficialBiasReport(const ICM42688P_OfficialBias_t *bias)
+{
+  char acc_x[16];
+  char acc_y[16];
+  char acc_z[16];
+  char gyr_x[16];
+  char gyr_y[16];
+  char gyr_z[16];
+
+  if (bias == NULL)
+  {
+    return;
+  }
+
+  UART_FormatFixedPoint(acc_x, sizeof(acc_x), UART_ScaleFloat(bias->accel_g[0], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(acc_y, sizeof(acc_y), UART_ScaleFloat(bias->accel_g[1], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(acc_z, sizeof(acc_z), UART_ScaleFloat(bias->accel_g[2], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_x, sizeof(gyr_x), UART_ScaleFloat(bias->gyro_dps[0], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_y, sizeof(gyr_y), UART_ScaleFloat(bias->gyro_dps[1], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_z, sizeof(gyr_z), UART_ScaleFloat(bias->gyro_dps[2], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+
+  (void)snprintf(uart_tx_buffer,
+                 sizeof(uart_tx_buffer),
+                 "Official GYR bias Q16[dps*65536]: %ld,%ld,%ld\r\n",
+                 (long)bias->gyro_q16[0],
+                 (long)bias->gyro_q16[1],
+                 (long)bias->gyro_q16[2]);
+  UART_SendString(uart_tx_buffer);
+
+  (void)snprintf(uart_tx_buffer,
+                 sizeof(uart_tx_buffer),
+                 "Official GYR bias[dps]: %s,%s,%s\r\n",
+                 gyr_x,
+                 gyr_y,
+                 gyr_z);
+  UART_SendString(uart_tx_buffer);
+
+  (void)snprintf(uart_tx_buffer,
+                 sizeof(uart_tx_buffer),
+                 "Official ACC bias Q16[g*65536]: %ld,%ld,%ld\r\n",
+                 (long)bias->accel_q16[0],
+                 (long)bias->accel_q16[1],
+                 (long)bias->accel_q16[2]);
+  UART_SendString(uart_tx_buffer);
+
+  (void)snprintf(uart_tx_buffer,
+                 sizeof(uart_tx_buffer),
+                 "Official ACC bias[g]: %s,%s,%s\r\n",
+                 acc_x,
+                 acc_y,
+                 acc_z);
+  UART_SendString(uart_tx_buffer);
+}
+
+/*
+ * Print the normal periodic IMU output once initialization is complete.
+ *
+ * At this stage:
+ * - self-test has already passed
+ * - official bias has already been reported to the user
+ * - the user has explicitly pressed Enter to begin the runtime phase
+ *
+ * So this function only focuses on presentation.
+ */
+static void UART_PrintConvertedImuData(const ICM42688P_Data_t *data)
+{
+  char acc_x[16];
+  char acc_y[16];
+  char acc_z[16];
+  char gyr_x[16];
+  char gyr_y[16];
+  char gyr_z[16];
+  char temp_c[16];
+
+  if (data == NULL)
+  {
+    return;
+  }
+
+  UART_FormatFixedPoint(acc_x, sizeof(acc_x), UART_ScaleFloat(data->accel_g[0], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(acc_y, sizeof(acc_y), UART_ScaleFloat(data->accel_g[1], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(acc_z, sizeof(acc_z), UART_ScaleFloat(data->accel_g[2], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_x, sizeof(gyr_x), UART_ScaleFloat(data->gyro_dps[0], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_y, sizeof(gyr_y), UART_ScaleFloat(data->gyro_dps[1], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(gyr_z, sizeof(gyr_z), UART_ScaleFloat(data->gyro_dps[2], (long)FIXED_POINT_3_SCALE), FIXED_POINT_3_SCALE, 3U);
+  UART_FormatFixedPoint(temp_c, sizeof(temp_c), UART_ScaleFloat(data->temperature_c, (long)FIXED_POINT_2_SCALE), FIXED_POINT_2_SCALE, 2U);
+
+  (void)snprintf(uart_tx_buffer,
+                 sizeof(uart_tx_buffer),
+                 "ACC[g]: %s,%s,%s GYR[dps]: %s,%s,%s TMP[C]: %s\r\n",
+                 acc_x,
+                 acc_y,
+                 acc_z,
+                 gyr_x,
+                 gyr_y,
+                 gyr_z,
+                 temp_c);
+  UART_SendString(uart_tx_buffer);
+}
+
+/*
+ * Full application-level IMU startup sequence.
+ *
+ * This is intentionally kept in main.c instead of hiding everything inside
+ * ICM42688P_Init(), because the user-facing boot messages are part of the
+ * product behavior:
+ * 1. initialize communication and default runtime config
+ * 2. run official self-test
+ * 3. read back the official bias that self-test produced
+ * 4. print that official bias
+ * 5. announce that initialization is complete
+ * 6. wait for the user to send Enter before starting runtime output
+ */
+static int IMU_StartupSequence(void)
+{
+  int status;
+  int self_test_result = 0;
+
+  UART_SendString("ICM42688P init start...\r\n");
+
+  status = ICM42688P_Init(&hspi3);
+  if (status != 0)
+  {
+    (void)snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "ICM42688P init failed: %d\r\n", status);
+    UART_SendString(uart_tx_buffer);
+    return status;
+  }
+
+  UART_SendString("ICM42688P self-test running...\r\n");
+  status = ICM42688P_RunSelfTest(&self_test_result);
+  if (status != 0)
+  {
+    (void)snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "ICM42688P self-test command failed: %d\r\n", status);
+    UART_SendString(uart_tx_buffer);
+    return status;
+  }
+
+  if (self_test_result != IMU_SELF_TEST_PASS_MASK)
+  {
+    (void)snprintf(uart_tx_buffer,
+                   sizeof(uart_tx_buffer),
+                   "ICM42688P self-test failed: ACC=%s GYR=%s\r\n",
+                   ((self_test_result & 0x02) != 0) ? "PASS" : "FAIL",
+                   ((self_test_result & 0x01) != 0) ? "PASS" : "FAIL");
+    UART_SendString(uart_tx_buffer);
+    return -1;
+  }
+
+  UART_SendString("ICM42688P self-test passed.\r\n");
+
+  status = ICM42688P_GetOfficialBias(&imu_official_bias);
+  if (status != 0)
+  {
+    (void)snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "ICM42688P official bias readback failed: %d\r\n", status);
+    UART_SendString(uart_tx_buffer);
+    return status;
+  }
+
+  UART_SendString("Official self-test bias report:\r\n");
+  UART_PrintOfficialBiasReport(&imu_official_bias);
+  UART_WaitForEnterCommand();
+
+  return 0;
 }
 
 /* USER CODE END 0 */
@@ -148,7 +538,19 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
+
+  /*
+   * Run the full IMU bring-up flow before entering the normal main loop.
+   * If any stage fails, we stop in Error_Handler() because subsequent periodic
+   * printing would otherwise be misleading.
+   */
+  if (IMU_StartupSequence() != 0)
+  {
+    Error_Handler();
+  }
+
   uart_send_last_tick = HAL_GetTick();
   uart_rx_last_tick = HAL_GetTick();
 
@@ -165,14 +567,28 @@ int main(void)
 
     if ((now - uart_send_last_tick) >= UART_SEND_PERIOD_MS)
     {
-      int tx_len = snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "%lu\r\n", (unsigned long)uart_counter++);
+      int tx_len = 0;
       uart_send_last_tick = now;
 
-      if (tx_len > 0)
+      /*
+       * Normal runtime phase:
+       * read one already-compensated sample and print converted values.
+       */
+      if (ICM42688P_ReadData(&imu_data) == 0)
       {
-        HAL_UART_Transmit(&huart1, (uint8_t *)uart_tx_buffer, (uint16_t)tx_len, HAL_MAX_DELAY);
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        UART_PrintConvertedImuData(&imu_data);
+        tx_len = 1;
       }
+      else
+      {
+        tx_len = snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "ICM42688P read failed\r\n");
+        if (tx_len > 0)
+        {
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_tx_buffer, (uint16_t)tx_len, HAL_MAX_DELAY);
+        }
+      }
+
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
     }
 
     while (HAL_UART_Receive(&huart1, &uart_rx_byte, 1U, 0U) == HAL_OK)
@@ -210,17 +626,16 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 60;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 5;
+  RCC_OscInitStruct.PLL.PLLN = 192;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
+  RCC_OscInitStruct.PLL.PLLR = 5;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -248,6 +663,67 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief SPI3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI3_Init(void)
+{
+
+  /* USER CODE BEGIN SPI3_Init 0 */
+
+  /* USER CODE END SPI3_Init 0 */
+
+  /* USER CODE BEGIN SPI3_Init 1 */
+
+  /* USER CODE END SPI3_Init 1 */
+  /* SPI3 parameter configuration*/
+  hspi3.Instance = SPI3;
+  hspi3.Init.Mode = SPI_MODE_MASTER;
+  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi3.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi3.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi3.Init.NSS = SPI_NSS_SOFT;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi3.Init.CRCPolynomial = 0x0;
+  hspi3.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi3.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi3.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi3.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi3.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi3.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi3.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi3.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi3.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi3.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI3_Init 2 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /*
+   * PA4 is used as a software-controlled chip-select for the IMU.
+   * We intentionally configure it after HAL_SPI_Init() so the pin is under
+   * plain GPIO control rather than SPI peripheral NSS control.
+   */
+  GPIO_InitStruct.Pin = ICM42688P_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(ICM42688P_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(ICM42688P_CS_GPIO_Port, ICM42688P_CS_Pin, GPIO_PIN_SET);
+
+  /* USER CODE END SPI3_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -263,7 +739,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 9600;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -309,7 +785,9 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);

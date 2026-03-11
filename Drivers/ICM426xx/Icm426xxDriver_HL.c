@@ -21,11 +21,11 @@
  * ________________________________________________________________________________________________________
  */
 
-#include "../Invn/Drivers/Icm426xx/Icm426xxDefs.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxExtFunc.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxDriver_HL.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxTransport.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxVersion.h"
+#include "Icm426xxDefs.h"
+#include "Icm426xxExtFunc.h"
+#include "Icm426xxDriver_HL.h"
+#include "Icm426xxTransport.h"
+#include "Icm426xxVersion.h"
 
 static int  inv_icm426xx_configure_serial_interface(struct inv_icm426xx *s);
 static int  inv_icm426xx_init_hardware_from_ui(struct inv_icm426xx *s);

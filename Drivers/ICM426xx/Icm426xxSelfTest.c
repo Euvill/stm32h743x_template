@@ -21,11 +21,11 @@
  * ________________________________________________________________________________________________________
  */
 
-#include "../Invn/Drivers/Icm426xx/Icm426xxSelfTest.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxDefs.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxExtFunc.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxTransport.h"
-#include "../Invn/Drivers/Icm426xx/Icm426xxDriver_HL.h"
+#include "Icm426xxSelfTest.h"
+#include "Icm426xxDefs.h"
+#include "Icm426xxExtFunc.h"
+#include "Icm426xxTransport.h"
+#include "Icm426xxDriver_HL.h"
 
 #include <stdio.h>
 #include <math.h>
