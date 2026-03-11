@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "STM32H7",
+      "includePath": [
+        "${workspaceFolder}/Core/Inc",
+        "${workspaceFolder}/Drivers/CMSIS/Include",
+        "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32H7xx/Include",
+        "${workspaceFolder}/Drivers/STM32H7xx_HAL_Driver/Inc",
+        "${workspaceFolder}/Drivers/STM32H7xx_HAL_Driver/Inc/Legacy",
+        "${workspaceFolder}/Drivers/ICM426xx"
+      ],
+      "defines": [
+        "USE_HAL_DRIVER",
+        "USE_PWR_LDO_SUPPLY",
+        "STM32H743xx"
+      ],
+      "compilerPath": "arm-none-eabi-gcc",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-gcc-arm"
+    }
+  ]
+}
